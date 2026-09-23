@@ -205,13 +205,13 @@ public:
 
 static bool common_pull_file(httplib::Client & cli,
                              const std::string & resolve_path,
-                             const std::string & path_tmp,
+                             const std::filesystem::path & path_tmp,
                              bool supports_ranges,
                              common_download_progress & p,
                              common_download_callback * callback) {
     std::ofstream ofs(path_tmp, std::ios::binary | std::ios::app);
     if (!ofs.is_open()) {
-        LOG_ERR("%s: error opening local file for writing: %s\n", __func__, path_tmp.c_str());
+        LOG_ERR("%s: error opening local file for writing: %s\n", __func__, path_tmp.string().c_str());
         return false;
     }
 
@@ -246,7 +246,7 @@ static bool common_pull_file(httplib::Client & cli,
         [&](const char *data, size_t len) {
             ofs.write(data, len);
             if (!ofs) {
-                LOG_ERR("%s: error writing to file: %s\n", func, path_tmp.c_str());
+                LOG_ERR("%s: error writing to file: %s\n", func, path_tmp.string().c_str());
                 return false;
             }
             p.downloaded += len;
@@ -286,7 +286,8 @@ static int common_download_file_single_online(const std::string & url,
     static const int max_attempts        = 3;
     static const int retry_delay_seconds = 2;
 
-    const bool file_exists = std::filesystem::exists(std::filesystem::u8path(path));
+    const std::filesystem::path local_path = skip_etag ? std::filesystem::u8path(path) : std::filesystem::path(path);
+    const bool file_exists = std::filesystem::exists(local_path);
 
     if (file_exists && skip_etag) {
         LOG_DBG("%s: using cached file: %s\n", __func__, path.c_str());
@@ -354,7 +355,8 @@ static int common_download_file_single_online(const std::string & url,
             return 304; // 304 Not Modified - fake cached response
         }
         // pass this point, the file exists but is different from the server version, so we need to redownload it
-        if (remove(path.c_str()) != 0) {
+        std::error_code ec;
+        if (std::filesystem::remove(local_path, ec) == false) {
             LOG_ERR("%s: unable to delete file: %s\n", __func__, path.c_str());
             return -1;
         }
@@ -362,11 +364,12 @@ static int common_download_file_single_online(const std::string & url,
 
     { // silent
         std::error_code ec;
-        std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+        std::filesystem::create_directories(local_path.parent_path(), ec);
     }
 
     bool success = false;
-    const std::string path_temporary = path + ".downloadInProgress";
+    std::filesystem::path path_temporary = local_path;
+    path_temporary += ".downloadInProgress";
     int delay = retry_delay_seconds;
 
     if (opts.callback) {
@@ -388,9 +391,12 @@ static int common_download_file_single_online(const std::string & url,
         if (std::filesystem::exists(path_temporary)) {
             if (supports_ranges) {
                 existing_size = std::filesystem::file_size(path_temporary);
-            } else if (remove(path_temporary.c_str()) != 0) {
-                LOG_ERR("%s: unable to delete file: %s\n", __func__, path_temporary.c_str());
-                break;
+            } else {
+                std::error_code ec;
+                if (std::filesystem::remove(path_temporary, ec) == false) {
+                    LOG_ERR("%s: unable to delete file: %s\n", __func__, path_temporary.string().c_str());
+                    break;
+                }
             }
         }
 
@@ -398,11 +404,13 @@ static int common_download_file_single_online(const std::string & url,
 
         LOG_DBG("%s: downloading from %s to %s (etag:%s)...\n",
                 __func__, common_http_show_masked_url(parts).c_str(),
-                path_temporary.c_str(), etag.c_str());
+                path_temporary.string().c_str(), etag.c_str());
 
         if (common_pull_file(cli, parts.path, path_temporary, supports_ranges, p, opts.callback)) {
-            if (std::rename(path_temporary.c_str(), path.c_str()) != 0) {
-                LOG_ERR("%s: unable to rename file: %s to %s\n", __func__, path_temporary.c_str(), path.c_str());
+            std::error_code ec;
+            std::filesystem::rename(path_temporary, local_path, ec);
+            if (ec) {
+                LOG_ERR("%s: unable to rename file: %s to %s\n", __func__, path_temporary.string().c_str(), path.c_str());
                 break;
             }
             if (!etag.empty() && !skip_etag) {
@@ -418,8 +426,9 @@ static int common_download_file_single_online(const std::string & url,
     }
     if (opts.callback && opts.callback->is_cancelled() &&
         std::filesystem::exists(path_temporary)) {
-        if (remove(path_temporary.c_str()) != 0) {
-            LOG_ERR("%s: unable to delete temporary file: %s\n", __func__, path_temporary.c_str());
+        std::error_code ec;
+        if (std::filesystem::remove(path_temporary, ec) == false) {
+            LOG_ERR("%s: unable to delete temporary file: %s\n", __func__, path_temporary.string().c_str());
         }
     }
     if (!success) {
